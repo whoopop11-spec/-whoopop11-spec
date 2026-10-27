@@ -1,0 +1,79 @@
+name: solve
+run-name: solve ${{ inputs.runid }}
+on:
+  workflow_dispatch:
+    inputs:
+      runid:
+        description: run id (jobs/<runid>.cnf)
+        required: true
+      timeout:
+        description: per-job solver timeout seconds
+        required: false
+        default: "840"
+permissions:
+  contents: write
+  actions: write
+jobs:
+  solve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        idx: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUNID: ${{ inputs.runid }}
+    steps:
+      - name: fetch cnf + runner
+        run: |
+          set -e
+          t0=$(date +%s)
+          for f in "jobs/${RUNID}.cnf:in.cnf" "scripts/runner.py:runner.py"; do
+            curl -sfL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.raw" \
+              "https://api.github.com/repos/${{ github.repository }}/contents/${f%%:*}?ref=${{ github.sha }}" -o "${f##*:}" &
+          done
+          wait
+          head -1 in.cnf; echo "fetch took $(( $(date +%s)-t0 ))s"
+      - name: solver versions
+        id: ver
+        run: |
+          k=$(git ls-remote https://github.com/arminbiere/kissat HEAD | cut -c1-12)
+          c=$(git ls-remote https://github.com/arminbiere/cadical HEAD | cut -c1-12)
+          echo "key=solvers-v1-$k-$c" >> $GITHUB_OUTPUT
+      - name: cache solvers
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: bin
+          key: ${{ steps.ver.outputs.key }}
+          restore-keys: solvers-v1-
+      - name: build solvers
+        if: steps.cache.outputs.cache-matched-key == ''
+        run: |
+          set -e
+          mkdir -p bin
+          ( git clone -q --depth 1 https://github.com/arminbiere/kissat && cd kissat && ./configure >/dev/null && make -j2 >/dev/null && cp build/kissat ../bin/ ) &
+          ( git clone -q --depth 1 https://github.com/arminbiere/cadical && cd cadical && ./configure >/dev/null && make -j2 >/dev/null && cp build/cadical ../bin/ ) &
+          wait
+          ls -la bin
+      - name: save cache
+        if: steps.cache.outputs.cache-matched-key == ''
+        uses: actions/cache/save@v4
+        with:
+          path: bin
+          key: ${{ steps.ver.outputs.key }}
+      - name: solve
+        id: solve
+        run: |
+          echo "job start->solve: ${SECONDS}s"
+          KISSAT=$PWD/bin/kissat CADICAL=$PWD/bin/cadical python3 runner.py in.cnf ${{ matrix.idx }} ${{ inputs.timeout }} sol.txt && echo "sat=1" >> $GITHUB_OUTPUT || true
+      - name: publish + cancel
+        if: steps.solve.outputs.sat == '1'
+        run: |
+          b64=$(base64 -w0 sol.txt)
+          printf '{"message":"result %s","content":"%s","branch":"%s"}' "$RUNID" "$b64" "${{ github.ref_name }}" > body.json
+          curl -s -o /dev/null -w "put %{http_code}\n" -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/contents/results/${RUNID}.txt" -d @body.json
+          cat sol.txt.who
+          gh run cancel ${{ github.run_id }} -R ${{ github.repository }} || true
